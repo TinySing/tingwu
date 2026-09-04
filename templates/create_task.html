@@ -1,0 +1,456 @@
+{% extends 'base.html' %}
+{% block content %}
+{% set task_mode = form_data.get('task_mode') or ('realtime' if meeting_join_url else 'offline') %}
+{% set default_config = default_realtime_config if task_mode == 'realtime' else default_offline_config %}
+<header><h1>CreateTask</h1><p>创建离线音视频转写任务或实时会议转写。日常只需改提示词，其余参数用 JSON 对象配置。</p></header>
+
+<div id="config-wrapper" class="config-collapse{{ ' collapsed' if meeting_join_url }}">
+  <div class="config-collapse-header" onclick="toggleConfig()">
+    <h2>{{ '会议已创建，参数配置已折叠（点击展开）' if meeting_join_url else '参数配置' }}</h2>
+    <span class="collapse-arrow">&#9660;</span>
+  </div>
+  <div class="config-collapse-body">
+    <form method="post" id="create-form" class="rerun-form" enctype="multipart/form-data">
+      <label>调用模式
+        <select name="task_mode" id="task-mode">
+          <option value="offline"{{ ' selected' if task_mode != 'realtime' }}>离线音视频转写</option>
+          <option value="realtime"{{ ' selected' if task_mode == 'realtime' }}>实时会议转写</option>
+        </select>
+      </label>
+
+      <div id="source-fields">
+        <label>音视频 URL
+          <div class="url-upload-row">
+            <input name="file_url" id="file-url" type="url" placeholder="https://example.com/meeting.mp4" value="{{ form_data.get('file_url', '') }}">
+            <button type="button" class="secondary" onclick="document.getElementById('file-input').click()">上传文件</button>
+            <input type="file" id="file-input" accept="audio/*,video/*" style="display:none">
+          </div>
+          <div id="upload-status" class="upload-status"></div>
+          <p class="hint">可直接输入 URL，或上传本地文件。注意：听悟云端必须能下载该 URL，<code>127.0.0.1</code> 本地地址云端拉不到，离线任务请用公网可访问地址（如 OSS）。</p>
+        </label>
+      </div>
+
+      <div class="config-collapse rerun-config-collapse collapsed" id="create-config" style="margin:16px 0">
+        <div class="config-collapse-header" onclick="toggleCreateConfig()">
+          <h2>常规参数配置（点击展开）</h2>
+          <span class="collapse-arrow">&#9660;</span>
+        </div>
+        <div class="config-collapse-body">
+          <label>buildTingwuMeetingCreatePayload 配置
+            <textarea name="meeting_config" id="meeting-config" class="config-text-sm" required>{{ form_data.get('meeting_config', default_config) }}</textarea>
+          </label>
+          <p class="hint">切换调用模式会自动切换对应默认 JSON；可在顶层覆盖 <code>sourceLanguage</code>；实时模式还会读取 <code>format</code> / <code>sampleRate</code>。</p>
+        </div>
+      </div>
+
+      <label>MEETING_CUSTOM_PROMPT_CONTENT
+        <textarea name="custom_prompt" id="custom-prompt" class="prompt-text-short" required placeholder="粘贴或编写自定义 Prompt；正文中必须包含 {Transcription}">{{ form_data.get('custom_prompt', '') }}</textarea>
+      </label>
+      <p class="hint">提交时固定生成 <code>summary / tingwu-plus / sentence-chat</code> 的 CustomPrompt 配置；内容会缓存到本机浏览器，下次自动带出上次内容。</p>
+
+      <button>提交 CreateTask</button>
+    </form>
+  </div>
+</div>
+
+<!-- ========== 下方：结果区域 ========== -->
+{% if meeting_join_url %}
+{# 实时模式：左右双栏，转写结果 + 控制/JSON #}
+<div class="page-split">
+  <div class="split-left">
+    <section class="card" id="rt-panel">
+      <div class="rt-header">
+        <div>
+          <span class="rt-badge rt-badge-info" id="rt-state">已创建</span>
+          <span class="rt-timer" id="rt-timer">00:00</span>
+        </div>
+        <div class="rt-task-id">TaskId: <code>{{ task_id }}</code></div>
+      </div>
+      <div class="rt-controls">
+        <button type="button" id="btn-record" onclick="RT.startRecording()">开始录音</button>
+        <button type="button" id="btn-pause" class="secondary" onclick="RT.pause()" disabled>暂停</button>
+        <button type="button" id="btn-resume" class="secondary" onclick="RT.resume()" disabled>恢复</button>
+        <button type="button" id="btn-end" class="danger" onclick="RT.endMeeting()">结束会议</button>
+      </div>
+      <div id="rt-transcript" class="rt-transcript rt-transcript-tall">
+        <div class="rt-placeholder">点击「开始录音」采集麦克风并推流至听悟…</div>
+      </div>
+      <div class="rt-debug-toggle">
+        <button type="button" class="secondary" onclick="RT.toggleDebug()">调试日志</button>
+        <button type="button" class="secondary" onclick="RT.copyTranscript()">复制转写文本</button>
+      </div>
+      <pre id="rt-debug" class="rt-debug" style="display:none"></pre>
+    </section>
+  </div>
+  <div class="split-right">
+    {% if result %}
+    <section class="card result"><h2>调用结果</h2><div class="copy-row"><button type="button" class="secondary" onclick="copyResult('create-result')">复制</button></div><textarea id="create-result" class="result-text" readonly>{{ result_text }}</textarea></section>
+    {% endif %}
+  </div>
+</div>
+
+{% elif result %}
+{# 离线模式：单栏展示结果 #}
+<section class="card result"><h2>调用结果</h2><div class="copy-row"><button type="button" class="secondary" onclick="copyResult('create-result')">复制完整结果</button></div><textarea id="create-result" class="result-text" readonly>{{ result_text }}</textarea></section>
+{% endif %}
+
+{% if meeting_join_url %}
+<script>
+window.RT = (function() {
+  var MEETING_JOIN_URL = {{ meeting_join_url|tojson }};
+  var TASK_ID = {{ task_id|tojson }};
+  var SAMPLE_RATE = parseInt({{ (result.get('Data',{}).get('Input',{}).get('SampleRate',16000) if result else 16000)|tojson }});
+  var SEND_INTERVAL = 100;
+
+  var state = 'created';
+  var ws = null, audioCtx = null, mediaStream = null, scriptNode = null;
+  var pcmBuffer = [], sendTimer = null;
+  var startTime = 0, totalRecordedMs = 0, timerInterval = null;
+  var sentences = {}, finalSentences = [];
+
+  function setState(s) {
+    state = s;
+    var badge = document.getElementById('rt-state');
+    var labels = { created:'已创建', recording:'录音中', paused:'已暂停', ended:'已结束' };
+    var colors = { created:'info', recording:'recording', paused:'paused', ended:'done' };
+    badge.textContent = labels[s] || s;
+    badge.className = 'rt-badge rt-badge-' + (colors[s] || '');
+    document.getElementById('btn-record').disabled = s !== 'created';
+    document.getElementById('btn-pause').disabled = s !== 'recording';
+    document.getElementById('btn-resume').disabled = s !== 'paused';
+    document.getElementById('btn-end').disabled = s === 'ended';
+  }
+
+  function log(msg) {
+    var el = document.getElementById('rt-debug');
+    el.textContent += '[' + new Date().toLocaleTimeString() + '] ' + msg + '\n';
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function updateTimer() {
+    var elapsed = totalRecordedMs + (state === 'recording' ? Date.now() - startTime : 0);
+    var sec = Math.floor(elapsed / 1000);
+    document.getElementById('rt-timer').textContent =
+      String(Math.floor(sec/60)).padStart(2,'0') + ':' + String(sec%60).padStart(2,'0');
+  }
+
+  function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  function renderTranscript() {
+    var el = document.getElementById('rt-transcript');
+    var html = '';
+    finalSentences.forEach(function(s) {
+      var spk = s.spk != null ? '<span class="rt-speaker">发言人'+s.spk+'</span>' : '';
+      html += '<div class="rt-sentence rt-final">' + spk + '<span>' + esc(s.text) + '</span></div>';
+    });
+    Object.keys(sentences).sort(function(a,b){return a-b}).forEach(function(idx) {
+      var s = sentences[idx];
+      var spk = s.spk != null ? '<span class="rt-speaker">发言人'+s.spk+'</span>' : '';
+      html += '<div class="rt-sentence rt-interim">' + spk + '<span>' + esc(s.text) + '</span></div>';
+    });
+    if (!html) html = '<div class="rt-placeholder">' + (state==='recording'?'正在聆听…':'等待录音…') + '</div>';
+    el.innerHTML = html;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function floatTo16BitPCM(f32) {
+    var buf = new ArrayBuffer(f32.length * 2), v = new DataView(buf);
+    for (var i = 0; i < f32.length; i++) {
+      var s = Math.max(-1, Math.min(1, f32[i]));
+      v.setInt16(i*2, s<0 ? s*0x8000 : s*0x7FFF, true);
+    }
+    return buf;
+  }
+
+  function downsample(buf, from, to) {
+    if (from === to) return buf;
+    var ratio = from / to, len = Math.round(buf.length / ratio), out = new Float32Array(len);
+    for (var i = 0; i < len; i++) {
+      var s = Math.round(i*ratio), e = Math.round((i+1)*ratio), sum = 0;
+      for (var j = s; j < e && j < buf.length; j++) sum += buf[j];
+      out[i] = sum / (e - s);
+    }
+    return out;
+  }
+
+  function initAudio() {
+    return navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: SAMPLE_RATE, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+    }).then(function(stream) {
+      mediaStream = stream;
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+      var source = audioCtx.createMediaStreamSource(stream);
+      scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+      scriptNode.onaudioprocess = function(e) {
+        if (state !== 'recording') return;
+        pcmBuffer.push(floatTo16BitPCM(downsample(e.inputBuffer.getChannelData(0), audioCtx.sampleRate, SAMPLE_RATE)));
+      };
+      source.connect(scriptNode);
+      scriptNode.connect(audioCtx.destination);
+    });
+  }
+
+  function stopAudio() {
+    if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+    if (audioCtx) { audioCtx.close().catch(function(){}); audioCtx = null; }
+    if (mediaStream) { mediaStream.getTracks().forEach(function(t){t.stop()}); mediaStream = null; }
+  }
+
+  function connectWS() {
+    return new Promise(function(resolve, reject) {
+      log('WebSocket 连接中…');
+      ws = new WebSocket(MEETING_JOIN_URL);
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = function() {
+        log('WebSocket 已连接');
+        ws.send(JSON.stringify({ header:{name:'StartTranscription',namespace:'SpeechTranscriber'}, payload:{format:'pcm'} }));
+        log('已发送 StartTranscription');
+        resolve();
+      };
+      ws.onmessage = function(evt) {
+        if (typeof evt.data !== 'string') return;
+        var d; try { d = JSON.parse(evt.data); } catch(e) { return; }
+        var name = (d.header||{}).name || '';
+        if (name !== 'TranscriptionResultChanged') log('← ' + name);
+        switch (name) {
+          case 'SentenceBegin':
+            sentences[d.payload.index] = { text:'', spk:d.payload.speaker_id }; break;
+          case 'TranscriptionResultChanged':
+            sentences[d.payload.index] = { text:d.payload.result||'', spk:d.payload.speaker_id };
+            renderTranscript(); break;
+          case 'SentenceEnd':
+            var txt = (d.payload.result||'');
+            if (d.payload.stash_result && d.payload.stash_result.text) txt += d.payload.stash_result.text;
+            finalSentences.push({ text:txt, spk:d.payload.speaker_id });
+            delete sentences[d.payload.index];
+            renderTranscript(); break;
+          case 'ResultTranslated':
+            log('翻译: ' + JSON.stringify(d.payload.translate_result)); break;
+          case 'TranscriptionCompleted':
+            log('转写完成'); break;
+        }
+      };
+      ws.onerror = function() { log('WebSocket 错误'); reject(new Error('WebSocket 连接失败')); };
+      ws.onclose = function(evt) { log('WebSocket 关闭 (code='+evt.code+')'); ws = null; };
+    });
+  }
+
+  function closeWS() {
+    if (!ws) return;
+    try { ws.send(JSON.stringify({ header:{name:'StopTranscription',namespace:'SpeechTranscriber'}, payload:{} })); log('已发送 StopTranscription'); } catch(e) {}
+    setTimeout(function(){ if(ws){ws.close();ws=null;} }, 2000);
+  }
+
+  function startSending() {
+    sendTimer = setInterval(function() {
+      if (state!=='recording'||!ws||ws.readyState!==WebSocket.OPEN) return;
+      if (!pcmBuffer.length) return;
+      var chunks = pcmBuffer.splice(0), total=0;
+      chunks.forEach(function(c){total+=c.byteLength});
+      var merged = new Uint8Array(total), off=0;
+      chunks.forEach(function(c){merged.set(new Uint8Array(c),off);off+=c.byteLength});
+      ws.send(merged.buffer);
+    }, SEND_INTERVAL);
+  }
+  function stopSending() { clearInterval(sendTimer); sendTimer=null; pcmBuffer=[]; }
+
+  // 结束会议后轮询后处理结果，并把最终 CustomPrompt/Summarization 展示到右侧结果区
+  function startFinalPolling() {
+    var attempts = 0;
+    var maxAttempts = 60; // 60 * 5s = 5 分钟
+
+    function setRightResult(text) {
+      try {
+        var el = document.getElementById('create-result');
+        if (el) el.value = text;
+      } catch(e) {}
+    }
+
+    function poll() {
+      attempts++;
+      if (attempts > maxAttempts) {
+        log('最终结果轮询超时，请在 GetTaskInfo 手动查询。');
+        window.__rtFinalPolling = false;
+        return;
+      }
+
+      fetch('/api/task-poll/' + TASK_ID)
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          if (!d.ok) {
+            log('最终结果轮询失败: ' + (d.error || 'unknown'));
+            window.__rtFinalPolling = false;
+            return;
+          }
+
+          if (d.status === 'COMPLETED') {
+            setRightResult(JSON.stringify({
+              TaskStatus: d.status,
+              customPromptContent: d.customPromptContent || '',
+              summarizationContent: d.summarizationContent || '',
+            }, null, 2));
+            log('已获取最终结果（后处理完成）。');
+            window.__rtFinalPolling = false;
+            return;
+          }
+
+          if (d.status === 'FAILED' || d.status === 'ERROR' || d.status === 'INVALID') {
+            setRightResult(JSON.stringify({
+              TaskStatus: d.status,
+              errorCode: d.errorCode || '',
+              errorMessage: d.errorMessage || '',
+            }, null, 2));
+            log('最终结果失败: ' + (d.errorMessage || d.status));
+            window.__rtFinalPolling = false;
+            return;
+          }
+
+          setTimeout(poll, 5000);
+        })
+        .catch(function(e) {
+          log('最终结果轮询网络错误: ' + e.message);
+          setTimeout(poll, 5000);
+        });
+    }
+
+    // 结束后立刻轮询一次，减少等待时间
+    setTimeout(poll, 1000);
+  }
+
+  return {
+    startRecording: function() {
+      if (state !== 'created') return;
+      setState('recording');
+      totalRecordedMs = 0; startTime = Date.now();
+      timerInterval = setInterval(updateTimer, 500); updateTimer();
+      renderTranscript();
+      initAudio().then(connectWS).then(startSending).catch(function(err) {
+        log('启动失败: '+err.message); alert('启动录音失败: '+err.message);
+        stopAudio(); setState('created'); clearInterval(timerInterval);
+      });
+    },
+    pause: function() {
+      if (state !== 'recording') return;
+      totalRecordedMs += Date.now() - startTime;
+      clearInterval(timerInterval); stopSending(); closeWS();
+      setState('paused'); log('已暂停');
+    },
+    resume: function() {
+      if (state !== 'paused') return;
+      setState('recording'); startTime = Date.now();
+      timerInterval = setInterval(updateTimer, 500);
+      connectWS().then(startSending).catch(function(err) {
+        log('恢复失败: '+err.message); alert('恢复连接失败: '+err.message);
+        setState('paused'); clearInterval(timerInterval);
+      });
+    },
+    endMeeting: function() {
+      if (state === 'ended') return;
+      if (state === 'recording') { totalRecordedMs += Date.now()-startTime; clearInterval(timerInterval); }
+      stopSending(); closeWS(); stopAudio(); setState('ended');
+      log('正在结束会议…');
+      if (window.__rtFinalPolling) {
+        log('已在轮询最终结果，跳过重复轮询');
+        return;
+      }
+      window.__rtFinalPolling = true;
+
+      fetch('/api/realtime/stop', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({taskId:TASK_ID}) })
+        .then(function(r){return r.json()})
+        .then(function(d){
+          log(d.ok ? '会议已结束。正在获取最终结果…' : '结束请求失败: '+d.error);
+          startFinalPolling();
+        })
+        .catch(function(err){
+          log('结束请求异常: '+err.message+'；仍将继续轮询最终结果');
+          startFinalPolling();
+        });
+    },
+    toggleDebug: function() { var el=document.getElementById('rt-debug'); el.style.display=el.style.display==='none'?'block':'none'; },
+    copyTranscript: function() {
+      var text = finalSentences.map(function(s){ return (s.spk!=null?'发言人'+s.spk+': ':'')+s.text; }).join('\n');
+      navigator.clipboard.writeText(text).then(function(){alert('已复制')});
+    }
+  };
+})();
+</script>
+{% endif %}
+
+<script>
+function copyResult(id){navigator.clipboard.writeText(document.getElementById(id).value)}
+
+var DEFAULT_CONFIGS = {
+  offline: {{ default_offline_config|tojson }},
+  realtime: {{ default_realtime_config|tojson }}
+};
+var lastMode = document.getElementById('task-mode').value;
+
+function normalizeConfigText(text) {
+  try { return JSON.stringify(JSON.parse(text)); } catch (e) { return (text || '').trim(); }
+}
+
+function setMode(options) {
+  var mode = document.getElementById('task-mode').value;
+  var force = options && options.force;
+  document.getElementById('source-fields').style.display = mode === 'offline' ? 'block' : 'none';
+
+  var field = document.getElementById('meeting-config');
+  if (!field) return;
+  var current = normalizeConfigText(field.value);
+  var previousDefault = normalizeConfigText(DEFAULT_CONFIGS[lastMode] || '');
+  var nextDefault = DEFAULT_CONFIGS[mode] || '';
+  // 仅在用户未改动上一模式默认值时自动切换，避免覆盖手动编辑
+  if (force || !field.value.trim() || current === previousDefault) {
+    field.value = nextDefault;
+    if (typeof resizeMeetingConfig === 'function') resizeMeetingConfig();
+  }
+  lastMode = mode;
+}
+document.getElementById('task-mode').addEventListener('change', function() { setMode(); });
+setMode({ force: !{{ (form_data.get('meeting_config') or '')|tojson }} });
+
+function toggleConfig(){
+  var el = document.getElementById('config-wrapper');
+  el.classList.toggle('collapsed');
+  var h = el.querySelector('.config-collapse-header h2');
+  h.textContent = el.classList.contains('collapsed') ? '参数配置（点击展开）' : '参数配置';
+}
+
+function resizeMeetingConfig() {
+  var field = document.getElementById('meeting-config');
+  if (!field) return;
+  field.style.height = 'auto';
+  field.style.height = Math.max(field.scrollHeight, 280) + 'px';
+}
+
+function toggleCreateConfig() {
+  var el = document.getElementById('create-config');
+  el.classList.toggle('collapsed');
+  var collapsed = el.classList.contains('collapsed');
+  el.querySelector('.config-collapse-header h2').textContent =
+    collapsed ? '常规参数配置（点击展开）' : '常规参数配置';
+  if (!collapsed) {
+    requestAnimationFrame(resizeMeetingConfig);
+  }
+}
+
+document.getElementById('meeting-config').addEventListener('input', resizeMeetingConfig);
+
+document.getElementById('file-input').addEventListener('change', function() {
+  var file = this.files[0]; if (!file) return;
+  var status = document.getElementById('upload-status');
+  status.textContent = '上传中: ' + file.name + '…'; status.className = 'upload-status';
+  var fd = new FormData(); fd.append('file', file);
+  fetch('/api/upload', { method:'POST', body:fd })
+    .then(function(r){return r.json()})
+    .then(function(data){
+      if (!data.ok) throw new Error(data.error);
+      document.getElementById('file-url').value = data.url;
+      status.textContent = '已上传: ' + data.filename; status.className = 'upload-status upload-ok';
+    })
+    .catch(function(err){ status.textContent = '上传失败: '+err.message; status.className = 'upload-status upload-err'; });
+  this.value = '';
+});
+</script>
+<script src="{{ url_for('static', filename='prompt-cache.js') }}"></script>
+{% endblock %}

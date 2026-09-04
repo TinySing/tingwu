@@ -1,0 +1,197 @@
+{% extends 'base.html' %}
+{% block content %}
+<header><h1>GetTaskInfo</h1><p>按 TaskId 查询任务状态、转码文件和全部算法结果；重新查询可获取未过期的结果下载地址。</p></header>
+<section class="card narrow">
+  <form method="post" id="query-form">
+    <label>TaskId<input name="task_id" id="query-task-id" value="{{ queried_task_id or '' }}" placeholder="输入 CreateTask 返回的 TaskId" required></label>
+    <button id="btn-query">查询任务</button>
+  </form>
+</section>
+
+{% if query_result %}
+<section class="card" id="poll-section">
+  <div class="rt-header">
+    <div>
+      <h2 style="display:inline;margin:0">任务状态</h2>
+      <span class="rt-badge" id="poll-status">{{ task_status or '未知' }}</span>
+      <span class="rt-task-id" style="margin-left:8px">TaskId: <code>{{ queried_task_id }}</code></span>
+    </div>
+  </div>
+  <div id="poll-progress" style="display:none">
+    <div class="poll-spinner-row">
+      <span class="poll-spinner"></span>
+      <span id="poll-message">任务处理中，正在自动轮询…</span>
+    </div>
+    <p class="hint">离开本页会自动停止轮询。</p>
+  </div>
+</section>
+
+{% if query_result_links %}
+<section class="card"><h2>结果下载</h2><div class="download-links">{% for name, link in query_result_links %}<a href="{{ link }}" target="_blank" rel="noopener">打开 {{ name }}</a>{% endfor %}</div></section>
+{% endif %}
+
+{% for block in summary_blocks %}
+<section class="card">
+  <h2>{{ block.title }}</h2>
+  {% if block.summary_preview %}
+  <p class="hint">{{ block.summary_preview }}</p>
+  {% elif block.id.startswith('summary-markdown') %}
+  <p class="hint">已从 CustomPrompt 结果中解析 <code>summaryMarkdown</code>，可直接复制。</p>
+  {% else %}
+  <p class="hint">已按 Markdown 渲染，可复制原文。</p>
+  {% endif %}
+  <div class="copy-row">
+    <button type="button" class="secondary" onclick="copyMarkdown('{{ block.id }}')">复制 Markdown</button>
+    <span id="copy-md-{{ block.id }}" class="hint"></span>
+  </div>
+  <textarea id="md-source-{{ block.id }}" class="md-source" readonly>{{ block.markdown }}</textarea>
+  <div id="md-view-{{ block.id }}" class="md-view"></div>
+</section>
+{% endfor %}
+
+{% if transcription_text %}
+<section class="card">
+  <h2>转写全文</h2>
+  <p class="hint">已按段落、发言人与句子拼接，可直接阅读或复制。</p>
+  <div class="copy-row">
+    <button type="button" class="secondary" onclick="copyTranscript()">复制转写文本</button>
+    <span id="copy-transcript-status" class="hint"></span>
+  </div>
+  <div id="transcript-view" class="transcript-view">{{ transcription_text }}</div>
+</section>
+{% endif %}
+
+<section class="card result">
+  <h2>原始响应</h2>
+  <div class="copy-row"><button type="button" class="secondary" onclick="copyResult()">复制完整结果</button><span id="copy-status" class="hint"></span></div>
+  <textarea id="query-result" class="result-text" readonly>{{ query_result_text }}</textarea>
+</section>
+{% endif %}
+
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script>
+function copyResult(){
+  navigator.clipboard.writeText(document.getElementById('query-result').value)
+    .then(function(){ document.getElementById('copy-status').textContent='已复制'; });
+}
+function copyTranscript(){
+  var el = document.getElementById('transcript-view');
+  if (!el) return;
+  navigator.clipboard.writeText(el.textContent)
+    .then(function(){ document.getElementById('copy-transcript-status').textContent='已复制'; });
+}
+function copyMarkdown(id){
+  var el = document.getElementById('md-source-' + id);
+  if (!el) return;
+  navigator.clipboard.writeText(el.value)
+    .then(function(){ document.getElementById('copy-md-' + id).textContent='已复制'; });
+}
+(function(){
+  if (!window.marked) return;
+  marked.setOptions({ breaks: true, gfm: true });
+  document.querySelectorAll('[id^="md-source-"]').forEach(function(source){
+    var id = source.id.replace('md-source-', '');
+    var view = document.getElementById('md-view-' + id);
+    if (view) view.innerHTML = marked.parse(source.value || '');
+  });
+})();
+
+(function(){
+  var taskId = {{ (queried_task_id or '')|tojson }};
+  var initialStatus = {{ (task_status or '')|tojson }};
+  if (!taskId) return;
+
+  var TERMINAL = { COMPLETED:1, FAILED:1, ERROR:1, INVALID:1 };
+  var statusEl = document.getElementById('poll-status');
+  var progressEl = document.getElementById('poll-progress');
+  var messageEl = document.getElementById('poll-message');
+  var resultEl = document.getElementById('query-result');
+  var timer = null;
+  var stopped = false;
+  var startedAt = Date.now();
+
+  function setStatus(text, cls) {
+    if (!statusEl) return;
+    statusEl.textContent = text;
+    statusEl.className = 'rt-badge rt-badge-' + (cls || 'info');
+  }
+
+  function stopPolling() {
+    stopped = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  }
+
+  function scheduleNext() {
+    if (stopped) return;
+    timer = setTimeout(poll, 5000);
+  }
+
+  function poll() {
+    if (stopped) return;
+    var elapsed = Math.floor((Date.now() - startedAt) / 1000);
+    if (messageEl) messageEl.textContent = '任务处理中，正在自动轮询… (' + elapsed + 's)';
+
+    fetch('/api/task-poll/' + encodeURIComponent(taskId))
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (stopped) return;
+        if (!d.ok) {
+          setStatus('轮询出错', 'error');
+          if (messageEl) messageEl.textContent = d.error || '轮询失败';
+          scheduleNext();
+          return;
+        }
+
+        var status = d.status || '未知';
+        if (status === 'COMPLETED') {
+          setStatus(status, 'done');
+          if (messageEl) messageEl.textContent = '已完成，正在刷新完整结果…';
+          stopPolling();
+          document.getElementById('query-form').submit();
+          return;
+        }
+        if (TERMINAL[status]) {
+          setStatus(status, 'error');
+          if (messageEl) {
+            messageEl.textContent = d.errorMessage
+              ? (d.errorMessage + (d.errorCode ? ' (' + d.errorCode + ')' : ''))
+              : ('任务结束: ' + status);
+          }
+          if (resultEl && d.raw) resultEl.value = JSON.stringify(d.raw, null, 2);
+          if (progressEl) progressEl.style.display = 'block';
+          stopPolling();
+          return;
+        }
+
+        setStatus(status, 'recording');
+        if (progressEl) progressEl.style.display = 'block';
+        if (resultEl && d.raw) resultEl.value = JSON.stringify(d.raw, null, 2);
+        scheduleNext();
+      })
+      .catch(function(e){
+        if (stopped) return;
+        setStatus('网络错误', 'error');
+        if (messageEl) messageEl.textContent = '请求失败: ' + e.message + '，稍后重试…';
+        if (progressEl) progressEl.style.display = 'block';
+        scheduleNext();
+      });
+  }
+
+  window.addEventListener('pagehide', stopPolling);
+  window.addEventListener('beforeunload', stopPolling);
+
+  if (!TERMINAL[initialStatus]) {
+    setStatus(initialStatus || '处理中', 'recording');
+    if (progressEl) progressEl.style.display = 'block';
+    scheduleNext();
+  } else if (initialStatus === 'COMPLETED') {
+    setStatus(initialStatus, 'done');
+  } else if (initialStatus) {
+    setStatus(initialStatus, 'error');
+  }
+})();
+</script>
+{% endblock %}

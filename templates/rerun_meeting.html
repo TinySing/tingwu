@@ -1,0 +1,164 @@
+{% extends 'base.html' %}
+{% block content %}
+<header><h1>重跑会议</h1><p>基于已完成的实时会议任务，使用 CustomPrompt 重新生成摘要结果。</p></header>
+
+<section class="card">
+  <form method="post" class="rerun-form" id="rerun-form">
+    <label>TaskId<input name="task_id" id="rerun-task-id" value="{{ form_data.get('task_id', '') }}" required placeholder="输入已完成会议的 TaskId"></label>
+
+    <div class="config-collapse rerun-config-collapse collapsed" id="rerun-config" style="margin:16px 0">
+      <div class="config-collapse-header" onclick="toggleRerunConfig()">
+        <h2>常规参数配置（点击展开）</h2>
+        <span class="collapse-arrow">&#9660;</span>
+      </div>
+      <div class="config-collapse-body">
+        <label>buildTingwuMeetingCreatePayload 配置
+          <textarea name="meeting_config" id="meeting-config" class="config-text-sm" required>{{ form_data.get('meeting_config', default_config) }}</textarea>
+        </label>
+        <p class="hint">重跑复用既有转写，自动忽略 <code>TargetAudioFormat</code> 与 <code>Transcription</code>；可在 JSON 顶层覆盖 <code>sourceLanguage</code>。</p>
+      </div>
+    </div>
+
+    <label>MEETING_CUSTOM_PROMPT_CONTENT
+      <textarea name="custom_prompt" id="custom-prompt" class="prompt-text-short" required placeholder="粘贴或编写自定义 Prompt；正文中必须包含 {Transcription}">{{ form_data.get('custom_prompt', '') }}</textarea>
+    </label>
+    <p class="hint">提交时固定生成 <code>summary / tingwu-plus / sentence-chat</code> 的 CustomPrompt 配置；内容会缓存到本机浏览器，下次自动带出上次内容。</p>
+
+    <button id="btn-rerun">重新生成</button>
+  </form>
+</section>
+
+<section class="card" id="result-section" style="display:{{ 'block' if rerun_task_id else 'none' }}">
+  <div class="rt-header">
+    <div>
+      <h2 style="display:inline;margin:0">执行结果</h2>
+      <span class="rt-badge" id="poll-status">{{ '等待中' if rerun_task_id else '' }}</span>
+      <span id="poll-task-label" class="rt-task-id" style="margin-left:8px">{% if rerun_task_id %}TaskId: <code>{{ rerun_task_id }}</code>{% endif %}</span>
+    </div>
+  </div>
+
+  <div id="poll-progress" style="display:{{ 'block' if rerun_task_id else 'none' }}">
+    <div class="poll-spinner-row">
+      <span class="poll-spinner"></span>
+      <span id="poll-message">正在等待听悟处理…</span>
+    </div>
+  </div>
+
+  <div id="result-content" style="display:none">
+    <div id="customprompt-section" style="display:none">
+      <h3 style="margin:16px 0 8px">CustomPrompt 输出</h3>
+      <div class="copy-row">
+        <button type="button" class="secondary"
+          onclick="navigator.clipboard.writeText(document.getElementById('result-customprompt-text').value).then(()=>this.textContent='已复制').catch(()=>{})">复制结果</button>
+      </div>
+      <textarea id="result-customprompt-text" class="result-text" readonly style="min-height:280px"></textarea>
+    </div>
+
+    <div id="summarization-section" style="display:none">
+      <h3 style="margin:16px 0 8px">Summarization 输出</h3>
+      <div class="copy-row">
+        <button type="button" class="secondary"
+          onclick="navigator.clipboard.writeText(document.getElementById('result-summarization-text').value).then(()=>this.textContent='已复制').catch(()=>{})">复制结果</button>
+      </div>
+      <textarea id="result-summarization-text" class="result-text" readonly style="min-height:280px"></textarea>
+    </div>
+  </div>
+</section>
+
+<script>
+function resizeMeetingConfig() {
+  var field = document.getElementById('meeting-config');
+  if (!field) return;
+  field.style.height = 'auto';
+  field.style.height = Math.max(field.scrollHeight, 280) + 'px';
+}
+
+function toggleRerunConfig() {
+  var el = document.getElementById('rerun-config');
+  el.classList.toggle('collapsed');
+  var collapsed = el.classList.contains('collapsed');
+  el.querySelector('.config-collapse-header h2').textContent =
+    collapsed ? '常规参数配置（点击展开）' : '常规参数配置';
+  if (!collapsed) {
+    requestAnimationFrame(resizeMeetingConfig);
+  }
+}
+
+document.getElementById('meeting-config').addEventListener('input', resizeMeetingConfig);
+
+(function() {
+  var taskId = {{ (rerun_task_id or '')|tojson }};
+  if (!taskId) return;
+
+  var statusEl = document.getElementById('poll-status');
+  var progressEl = document.getElementById('poll-progress');
+  var messageEl = document.getElementById('poll-message');
+  var contentEl = document.getElementById('result-content');
+  var customTextEl = document.getElementById('result-customprompt-text');
+  var summaryTextEl = document.getElementById('result-summarization-text');
+  var customSectionEl = document.getElementById('customprompt-section');
+  var summarySectionEl = document.getElementById('summarization-section');
+  var attempts = 0;
+  var maxAttempts = 60;
+
+  function setStatus(text, cls) {
+    statusEl.textContent = text;
+    statusEl.className = 'rt-badge rt-badge-' + (cls || 'info');
+  }
+
+  function poll() {
+    attempts++;
+    if (attempts > maxAttempts) {
+      setStatus('超时', 'error');
+      messageEl.textContent = '轮询超时，请在 GetTaskInfo 中手动查询。';
+      return;
+    }
+    messageEl.textContent = '正在等待听悟处理… (' + (attempts * 5) + 's)';
+
+    fetch('/api/task-poll/' + taskId)
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (!d.ok) {
+          setStatus('出错', 'error');
+          messageEl.textContent = d.error;
+          return;
+        }
+        if (d.status === 'COMPLETED') {
+          setStatus('完成', 'done');
+          progressEl.style.display = 'none';
+          contentEl.style.display = 'block';
+          var cp = d.customPromptContent || '';
+          var sm = d.summarizationContent || '';
+          if (cp) {
+            customTextEl.value = cp;
+            customSectionEl.style.display = 'block';
+          } else {
+            customSectionEl.style.display = 'none';
+            customTextEl.value = '';
+          }
+          if (sm) {
+            summaryTextEl.value = sm;
+            summarySectionEl.style.display = 'block';
+          } else {
+            summarySectionEl.style.display = 'none';
+            summaryTextEl.value = '';
+          }
+        } else if (d.status === 'FAILED' || d.status === 'ERROR' || d.status === 'INVALID') {
+          setStatus('失败', 'error');
+          messageEl.textContent = (d.errorMessage ? d.errorMessage : ('任务失败: ' + d.status));
+        } else {
+          setStatus(d.status || '处理中', 'recording');
+          setTimeout(poll, 5000);
+        }
+      })
+      .catch(function(e) {
+        setStatus('网络错误', 'error');
+        messageEl.textContent = '请求失败: ' + e.message;
+      });
+  }
+
+  setTimeout(poll, 2000);
+})();
+</script>
+<script src="{{ url_for('static', filename='prompt-cache.js') }}"></script>
+{% endblock %}

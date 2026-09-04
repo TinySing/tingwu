@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>听悟 API 管理台</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <aside>
+    <div class="brand">听悟 <span>API 管理台</span></div>
+    <nav>
+      <a class="{{ 'active' if request.endpoint == 'create_task' }}" href="{{ url_for('create_task') }}">CreateTask</a>
+      <a class="{{ 'active' if request.endpoint == 'get_task_info' }}" href="{{ url_for('get_task_info') }}">GetTaskInfo</a>
+      <a class="{{ 'active' if request.endpoint == 'rerun_meeting' }}" href="{{ url_for('rerun_meeting') }}">重跑会议</a>
+      <a class="{{ 'active' if request.endpoint == 'prompt_tuner' }}" href="{{ url_for('prompt_tuner') }}">Prompt 调优</a>
+      <a class="{{ 'active' if request.endpoint in ['phrases', 'phrase_detail'] }}" href="{{ url_for('phrases') }}">热词词表</a>
+      <a class="{{ 'active' if request.endpoint == 'settings' }}" href="{{ url_for('settings') }}">配置中心</a>
+    </nav>
+  </aside>
+  <main>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}<div class="notice {{ category }}">{{ message }}</div>{% endfor %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

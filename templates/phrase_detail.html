@@ -1,0 +1,10 @@
+{% extends 'base.html' %}
+{% block content %}
+<header><h1>编辑热词词表</h1><p>PhraseId：<code>{{ phrase.PhraseId }}</code></p></header>
+<section class="card narrow"><form method="post" action="{{ url_for('update_phrase', phrase_id=phrase.PhraseId) }}">
+  <label>名称<input name="name" value="{{ phrase.Name }}" required></label>
+  <label>说明<input name="description" value="{{ phrase.Description or '' }}"></label>
+  <label>热词与权重（JSON）<textarea name="word_weights" required>{{ phrase.WordWeights or '{}' }}</textarea></label>
+  <button>保存修改</button> <a class="secondary" href="{{ url_for('phrases') }}">返回列表</a>
+</form></section>
+{% endblock %}

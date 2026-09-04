@@ -1,0 +1,90 @@
+{% extends 'base.html' %}
+{% block content %}
+<header>
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <div><h1>热词词表</h1><p>管理转写时可复用的热词和权重。</p></div>
+    <button type="button" onclick="PH.openCreate()">新建词表</button>
+  </div>
+</header>
+
+<section class="card">
+{% if phrases %}
+<table class="ph-table">
+  <thead><tr><th>名称</th><th>说明</th><th>PhraseId</th><th style="width:160px">操作</th></tr></thead>
+  <tbody>
+  {% for p in phrases %}
+  <tr>
+    <td><strong>{{ p.Name }}</strong></td>
+    <td>{{ p.Description or '—' }}</td>
+    <td><code>{{ p.PhraseId }}</code></td>
+    <td class="actions">
+      <a href="javascript:void(0)" onclick="PH.openEdit('{{ p.PhraseId }}')">编辑</a>
+      <form method="post" action="{{ url_for('delete_phrase', phrase_id=p.PhraseId) }}" onsubmit="return confirm('确定删除「{{ p.Name }}」吗？')" style="display:inline"><button class="danger" style="padding:5px 10px;font-size:12px">删除</button></form>
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="hint">暂无词表。点击右上角「新建词表」创建。</p>
+{% endif %}
+</section>
+
+<!-- Modal -->
+<div class="modal-overlay" id="ph-modal" style="display:none" onclick="if(event.target===this)PH.close()">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2 id="modal-title">新建词表</h2>
+      <button type="button" class="modal-close" onclick="PH.close()">&times;</button>
+    </div>
+    <form id="ph-form" method="post">
+      <label>名称<input name="name" id="ph-name" required></label>
+      <label>说明<input name="description" id="ph-desc"></label>
+      <label>热词与权重（JSON）<textarea name="word_weights" id="ph-weights" required placeholder='{"听悟": 3, "通义": 2}' style="min-height:140px"></textarea></label>
+      <p class="hint">格式：<code>{"词语": 权重}</code>，权重 1-5。</p>
+      <div style="display:flex;gap:10px;margin-top:16px">
+        <button type="submit" id="ph-submit">创建</button>
+        <button type="button" class="secondary" onclick="PH.close()">取消</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+window.PH = {
+  openCreate: function() {
+    document.getElementById('modal-title').textContent = '新建词表';
+    document.getElementById('ph-submit').textContent = '创建';
+    document.getElementById('ph-form').action = '{{ url_for("create_phrase") }}';
+    document.getElementById('ph-name').value = '';
+    document.getElementById('ph-desc').value = '';
+    document.getElementById('ph-weights').value = '';
+    document.getElementById('ph-modal').style.display = 'flex';
+  },
+  openEdit: function(phraseId) {
+    document.getElementById('modal-title').textContent = '编辑词表';
+    document.getElementById('ph-submit').textContent = '保存';
+    document.getElementById('ph-form').action = '/phrases/' + phraseId + '/update';
+    document.getElementById('ph-modal').style.display = 'flex';
+    document.getElementById('ph-name').value = '加载中…';
+    document.getElementById('ph-desc').value = '';
+    document.getElementById('ph-weights').value = '';
+    fetch('/api/phrases/' + phraseId)
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (!d.ok) { alert(d.error); PH.close(); return; }
+        document.getElementById('ph-name').value = d.data.Name || '';
+        document.getElementById('ph-desc').value = d.data.Description || '';
+        var ww = d.data.WordWeights || '{}';
+        try { ww = JSON.stringify(JSON.parse(ww), null, 2); } catch(e) {}
+        document.getElementById('ph-weights').value = ww;
+      })
+      .catch(function() { alert('加载失败'); PH.close(); });
+  },
+  close: function() {
+    document.getElementById('ph-modal').style.display = 'none';
+  }
+};
+document.addEventListener('keydown', function(e) { if (e.key === 'Escape') PH.close(); });
+</script>
+{% endblock %}

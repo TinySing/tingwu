@@ -1,0 +1,435 @@
+{% extends 'base.html' %}
+{% block content %}
+<header><h1>实时转写</h1><p>创建实时会议，通过浏览器麦克风采集音频推流，实时获取转写结果。</p></header>
+
+<!-- 配置区 -->
+<section class="card" id="config-section">
+  <h2>会议配置</h2>
+  <div class="two">
+    <label>音频格式
+      <select id="cfg-format">
+        <option value="pcm" selected>pcm</option>
+        <option value="opus">opus</option>
+        <option value="aac">aac</option>
+        <option value="mp3">mp3</option>
+      </select>
+    </label>
+    <label>采样率
+      <select id="cfg-sample-rate">
+        <option value="16000" selected>16000 Hz</option>
+        <option value="8000">8000 Hz</option>
+      </select>
+    </label>
+  </div>
+  <div class="two">
+    <label>识别语言
+      <select id="cfg-language">
+        <option value="cn">中文</option>
+        <option value="en">英文</option>
+        <option value="yue">粤语</option>
+        <option value="ja">日语</option>
+      </select>
+    </label>
+    <label>热词词表 ID（可选）
+      <input id="cfg-phrase-id" placeholder="留空则不使用热词">
+    </label>
+  </div>
+  <div class="checks">
+    <label><input type="checkbox" id="cfg-diarization" checked> 说话人分离</label>
+    <label><input type="checkbox" id="cfg-translation"> 启用翻译</label>
+  </div>
+  <div id="translation-opts" class="option-group" style="display:none">
+    <strong>翻译目标语言</strong>
+    <label><input type="checkbox" class="cfg-trans-lang" value="en" checked> 英文</label>
+    <label><input type="checkbox" class="cfg-trans-lang" value="cn"> 中文</label>
+    <label><input type="checkbox" class="cfg-trans-lang" value="ja"> 日语</label>
+  </div>
+  <button type="button" id="btn-create" onclick="RT.createMeeting()">创建会议</button>
+</section>
+
+<!-- 控制区 -->
+<section class="card" id="control-section" style="display:none">
+  <div class="rt-header">
+    <div>
+      <span class="rt-badge" id="rt-state">已创建</span>
+      <span class="rt-timer" id="rt-timer">00:00</span>
+    </div>
+    <div class="rt-task-id">TaskId: <code id="rt-task-id"></code></div>
+  </div>
+  <div class="rt-controls">
+    <button type="button" id="btn-record" onclick="RT.startRecording()">开始录音</button>
+    <button type="button" id="btn-pause" class="secondary" onclick="RT.pause()" disabled>暂停</button>
+    <button type="button" id="btn-resume" class="secondary" onclick="RT.resume()" disabled>恢复</button>
+    <button type="button" id="btn-end" class="danger" onclick="RT.endMeeting()">结束会议</button>
+  </div>
+</section>
+
+<!-- 转写结果区 -->
+<section class="card" id="transcript-section" style="display:none">
+  <h2>转写结果</h2>
+  <div id="rt-transcript" class="rt-transcript">
+    <div class="rt-placeholder">等待录音开始…</div>
+  </div>
+  <div class="rt-debug-toggle">
+    <button type="button" class="secondary" onclick="RT.toggleDebug()">调试日志</button>
+    <button type="button" class="secondary" onclick="RT.copyTranscript()">复制转写文本</button>
+  </div>
+  <pre id="rt-debug" class="rt-debug" style="display:none"></pre>
+</section>
+
+<script>
+window.RT = (function() {
+  const SEND_INTERVAL = 100;
+
+  let state = 'idle'; // idle | created | recording | paused | ended
+  let ws = null;
+  let audioCtx = null;
+  let mediaStream = null;
+  let scriptNode = null;
+  let pcmBuffer = [];
+  let sendTimer = null;
+  let startTime = 0;
+  let totalRecordedMs = 0;
+  let timerInterval = null;
+
+  let meetingJoinUrl = '';
+  let taskId = '';
+  let sampleRate = 16000;
+
+  let sentences = {};
+  let finalSentences = [];
+
+  function setState(s) {
+    state = s;
+    const badge = document.getElementById('rt-state');
+    const labels = { idle: '空闲', created: '已创建', recording: '录音中', paused: '已暂停', ended: '已结束' };
+    const colors = { idle: '', created: 'info', recording: 'recording', paused: 'paused', ended: 'done' };
+    badge.textContent = labels[s] || s;
+    badge.className = 'rt-badge rt-badge-' + (colors[s] || '');
+
+    document.getElementById('btn-record').disabled = s !== 'created';
+    document.getElementById('btn-pause').disabled = s !== 'recording';
+    document.getElementById('btn-resume').disabled = s !== 'paused';
+    document.getElementById('btn-end').disabled = (s === 'idle' || s === 'ended');
+  }
+
+  function log(msg) {
+    const el = document.getElementById('rt-debug');
+    el.textContent += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function updateTimer() {
+    const elapsed = totalRecordedMs + (state === 'recording' ? Date.now() - startTime : 0);
+    const sec = Math.floor(elapsed / 1000);
+    const m = String(Math.floor(sec / 60)).padStart(2, '0');
+    const s = String(sec % 60).padStart(2, '0');
+    document.getElementById('rt-timer').textContent = m + ':' + s;
+  }
+
+  function escHtml(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function renderTranscript() {
+    const el = document.getElementById('rt-transcript');
+    let html = '';
+    finalSentences.forEach(function(s) {
+      const spk = s.speakerId != null ? '<span class="rt-speaker">发言人' + s.speakerId + '</span>' : '';
+      html += '<div class="rt-sentence rt-final">' + spk + '<span>' + escHtml(s.text) + '</span></div>';
+    });
+    Object.keys(sentences).sort(function(a, b) { return a - b; }).forEach(function(idx) {
+      const s = sentences[idx];
+      const spk = s.speakerId != null ? '<span class="rt-speaker">发言人' + s.speakerId + '</span>' : '';
+      html += '<div class="rt-sentence rt-interim">' + spk + '<span>' + escHtml(s.text) + '</span></div>';
+    });
+    if (!html) html = '<div class="rt-placeholder">' + (state === 'recording' ? '正在聆听…' : '等待录音开始…') + '</div>';
+    el.innerHTML = html;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function floatTo16BitPCM(float32) {
+    const buf = new ArrayBuffer(float32.length * 2);
+    const view = new DataView(buf);
+    for (let i = 0; i < float32.length; i++) {
+      const s = Math.max(-1, Math.min(1, float32[i]));
+      view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    return buf;
+  }
+
+  function downsample(buffer, from, to) {
+    if (from === to) return buffer;
+    const ratio = from / to;
+    const len = Math.round(buffer.length / ratio);
+    const result = new Float32Array(len);
+    for (let i = 0; i < len; i++) {
+      const start = Math.round(i * ratio);
+      const end = Math.round((i + 1) * ratio);
+      let sum = 0;
+      for (let j = start; j < end && j < buffer.length; j++) sum += buffer[j];
+      result[i] = sum / (end - start);
+    }
+    return result;
+  }
+
+  function initAudio() {
+    return navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: sampleRate, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+    }).then(function(stream) {
+      mediaStream = stream;
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sampleRate });
+      const source = audioCtx.createMediaStreamSource(stream);
+      scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+      scriptNode.onaudioprocess = function(e) {
+        if (state !== 'recording') return;
+        const input = e.inputBuffer.getChannelData(0);
+        const down = downsample(input, audioCtx.sampleRate, sampleRate);
+        pcmBuffer.push(floatTo16BitPCM(down));
+      };
+      source.connect(scriptNode);
+      scriptNode.connect(audioCtx.destination);
+    });
+  }
+
+  function stopAudio() {
+    if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+    if (audioCtx) { audioCtx.close().catch(function(){}); audioCtx = null; }
+    if (mediaStream) { mediaStream.getTracks().forEach(function(t) { t.stop(); }); mediaStream = null; }
+  }
+
+  function connectWS() {
+    return new Promise(function(resolve, reject) {
+      log('WebSocket 连接中…');
+      ws = new WebSocket(meetingJoinUrl);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = function() {
+        log('WebSocket 已连接');
+        ws.send(JSON.stringify({
+          header: { name: 'StartTranscription', namespace: 'SpeechTranscriber' },
+          payload: { format: 'pcm' }
+        }));
+        log('已发送 StartTranscription');
+        resolve();
+      };
+
+      ws.onmessage = function(evt) {
+        if (typeof evt.data !== 'string') return;
+        var data;
+        try { data = JSON.parse(evt.data); } catch(e) { return; }
+        var name = (data.header || {}).name || '';
+        if (name !== 'TranscriptionResultChanged') log('← ' + name);
+
+        switch (name) {
+          case 'SentenceBegin':
+            sentences[data.payload.index] = { text: '', speakerId: data.payload.speaker_id };
+            break;
+          case 'TranscriptionResultChanged':
+            sentences[data.payload.index] = {
+              text: data.payload.result || '',
+              speakerId: data.payload.speaker_id
+            };
+            renderTranscript();
+            break;
+          case 'SentenceEnd':
+            var txt = (data.payload.result || '');
+            if (data.payload.stash_result && data.payload.stash_result.text) txt += data.payload.stash_result.text;
+            finalSentences.push({ text: txt, speakerId: data.payload.speaker_id });
+            delete sentences[data.payload.index];
+            renderTranscript();
+            break;
+          case 'ResultTranslated':
+            log('翻译: ' + JSON.stringify(data.payload.translate_result));
+            break;
+          case 'TranscriptionCompleted':
+            log('转写完成');
+            break;
+        }
+      };
+
+      ws.onerror = function() {
+        log('WebSocket 错误');
+        reject(new Error('WebSocket 连接失败'));
+      };
+
+      ws.onclose = function(evt) {
+        log('WebSocket 关闭 (code=' + evt.code + ')');
+        ws = null;
+      };
+    });
+  }
+
+  function closeWS() {
+    if (!ws) return;
+    try {
+      ws.send(JSON.stringify({
+        header: { name: 'StopTranscription', namespace: 'SpeechTranscriber' },
+        payload: {}
+      }));
+      log('已发送 StopTranscription');
+    } catch(e) {}
+    setTimeout(function() { if (ws) { ws.close(); ws = null; } }, 2000);
+  }
+
+  function startSending() {
+    sendTimer = setInterval(function() {
+      if (state !== 'recording' || !ws || ws.readyState !== WebSocket.OPEN) return;
+      if (pcmBuffer.length === 0) return;
+      var chunks = pcmBuffer.splice(0);
+      var total = 0;
+      chunks.forEach(function(c) { total += c.byteLength; });
+      var merged = new Uint8Array(total);
+      var off = 0;
+      chunks.forEach(function(c) { merged.set(new Uint8Array(c), off); off += c.byteLength; });
+      ws.send(merged.buffer);
+    }, SEND_INTERVAL);
+  }
+
+  function stopSending() {
+    clearInterval(sendTimer);
+    sendTimer = null;
+    pcmBuffer = [];
+  }
+
+  // --- Public API ---
+
+  function createMeeting() {
+    var cfg = {
+      format: document.getElementById('cfg-format').value,
+      sampleRate: parseInt(document.getElementById('cfg-sample-rate').value),
+      sourceLanguage: document.getElementById('cfg-language').value,
+      phraseId: document.getElementById('cfg-phrase-id').value.trim(),
+      diarizationEnabled: document.getElementById('cfg-diarization').checked,
+    };
+    sampleRate = cfg.sampleRate;
+
+    if (document.getElementById('cfg-translation').checked) {
+      var langs = [];
+      document.querySelectorAll('.cfg-trans-lang:checked').forEach(function(el) { langs.push(el.value); });
+      if (langs.length) cfg.translationLanguages = langs;
+    }
+
+    document.getElementById('btn-create').disabled = true;
+    document.getElementById('btn-create').textContent = '创建中…';
+
+    fetch('/api/realtime/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cfg)
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (!data.ok) throw new Error(data.error);
+      taskId = data.taskId;
+      meetingJoinUrl = data.meetingJoinUrl;
+      log('会议创建成功, TaskId=' + taskId);
+      log('MeetingJoinUrl=' + meetingJoinUrl.substring(0, 80) + '…');
+
+      document.getElementById('rt-task-id').textContent = taskId;
+      document.getElementById('config-section').style.display = 'none';
+      document.getElementById('control-section').style.display = 'block';
+      document.getElementById('transcript-section').style.display = 'block';
+      setState('created');
+    })
+    .catch(function(err) {
+      alert('创建失败: ' + err.message);
+      document.getElementById('btn-create').disabled = false;
+      document.getElementById('btn-create').textContent = '创建会议';
+    });
+  }
+
+  function startRecording() {
+    if (state !== 'created') return;
+    setState('recording');
+    sentences = {};
+    finalSentences = [];
+    totalRecordedMs = 0;
+    startTime = Date.now();
+    timerInterval = setInterval(updateTimer, 500);
+    renderTranscript();
+
+    initAudio()
+      .then(function() { return connectWS(); })
+      .then(function() { startSending(); })
+      .catch(function(err) {
+        log('启动失败: ' + err.message);
+        alert('启动录音失败: ' + err.message);
+        stopAudio();
+        setState('created');
+        clearInterval(timerInterval);
+      });
+  }
+
+  function pause() {
+    if (state !== 'recording') return;
+    totalRecordedMs += Date.now() - startTime;
+    clearInterval(timerInterval);
+    stopSending();
+    closeWS();
+    setState('paused');
+    log('已暂停');
+  }
+
+  function resume() {
+    if (state !== 'paused') return;
+    setState('recording');
+    startTime = Date.now();
+    timerInterval = setInterval(updateTimer, 500);
+
+    connectWS()
+      .then(function() { startSending(); })
+      .catch(function(err) {
+        log('恢复失败: ' + err.message);
+        alert('恢复连接失败: ' + err.message);
+        setState('paused');
+        clearInterval(timerInterval);
+      });
+  }
+
+  function endMeeting() {
+    if (state === 'idle' || state === 'ended') return;
+    if (state === 'recording') {
+      totalRecordedMs += Date.now() - startTime;
+      clearInterval(timerInterval);
+    }
+    stopSending();
+    closeWS();
+    stopAudio();
+    setState('ended');
+    log('正在结束会议…');
+
+    fetch('/api/realtime/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskId: taskId })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (!data.ok) log('结束会议失败: ' + data.error);
+      else log('会议已结束。可前往 GetTaskInfo 查询最终结果。');
+    })
+    .catch(function(err) { log('结束会议请求异常: ' + err.message); });
+  }
+
+  function toggleDebug() {
+    var el = document.getElementById('rt-debug');
+    el.style.display = el.style.display === 'none' ? 'block' : 'none';
+  }
+
+  function copyTranscript() {
+    var text = finalSentences.map(function(s) {
+      return (s.speakerId != null ? '发言人' + s.speakerId + ': ' : '') + s.text;
+    }).join('\n');
+    navigator.clipboard.writeText(text).then(function() { alert('已复制'); });
+  }
+
+  // translation toggle
+  document.getElementById('cfg-translation').addEventListener('change', function() {
+    document.getElementById('translation-opts').style.display = this.checked ? 'flex' : 'none';
+  });
+
+  return { createMeeting: createMeeting, startRecording: startRecording, pause: pause, resume: resume, endMeeting: endMeeting, toggleDebug: toggleDebug, copyTranscript: copyTranscript };
+})();
+</script>
+{% endblock %}

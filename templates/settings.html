@@ -1,0 +1,14 @@
+{% extends 'base.html' %}
+{% block content %}
+<header><h1>配置中心</h1><p>凭证只保存在本机项目目录的 <code>.env</code> 文件中，不会发送到浏览器以外的服务。</p></header>
+<section class="card narrow"><form method="post">
+  <label>AccessKey ID <input name="TINGWU_ACCESS_KEY_ID" placeholder="{{ masked(settings.get('TINGWU_ACCESS_KEY_ID')) }}"></label>
+  <label>AccessKey Secret <input type="password" name="TINGWU_ACCESS_KEY_SECRET" placeholder="{{ masked(settings.get('TINGWU_ACCESS_KEY_SECRET')) }}"></label>
+  <label>AppKey <input name="TINGWU_APP_KEY" placeholder="{{ masked(settings.get('TINGWU_APP_KEY')) }}"></label>
+  <p class="hint">留空不会覆盖已保存的值。建议使用权限最小化的 RAM 用户 AccessKey。</p>
+  <hr style="margin:20px 0;border:0;border-top:1px solid var(--line)">
+  <label>DeepSeek API Key（Prompt 调优功能需要）<input type="password" name="DEEPSEEK_API_KEY" placeholder="{{ masked(settings.get('DEEPSEEK_API_KEY')) }}"></label>
+  <p class="hint">用于 Prompt 自动调优功能。在 <a href="https://platform.deepseek.com" target="_blank">platform.deepseek.com</a> 获取。</p>
+  <button>保存配置</button>
+</form></section>
+{% endblock %}

@@ -1,0 +1,310 @@
+{% extends 'base.html' %}
+{% block content %}
+<header><h1>Prompt 调优</h1><p>基于已完成会议的转写结果，自动生成并迭代优化 CustomPrompt 提示词；完成后可继续追问修改。</p></header>
+
+<div class="config-grid">
+  <div class="config-col">
+    <section class="card">
+      <h2>调优配置</h2>
+      <label>源会议 TaskId<input id="pt-task-id" placeholder="已完成的离线/实时会议 TaskId" required></label>
+      <label>期望输出描述<textarea id="pt-goal" placeholder="描述你希望得到的输出格式和内容，例如：&#10;- 提取每位发言人的核心观点，按发言人分组&#10;- 输出 markdown 格式的表格，包含：发言人、议题、结论&#10;- 生成不超过200字的会议纪要，突出待办事项" style="min-height:140px"></textarea></label>
+      <label>初始提示词（可选）<textarea id="pt-initial" placeholder="填「发给听悟的 CustomPrompt 全文」，必须含 {Transcription}。&#10;不要填听悟返回的 JSON/纪要结果。&#10;留空则由 DeepSeek 自动生成第一版。" style="min-height:80px"></textarea></label>
+      <p class="hint">初始提示词 = CreateTask / 重跑会议里的 <code>MEETING_CUSTOM_PROMPT_CONTENT</code>，不是任务查询出来的输出。</p>
+      <div class="two">
+        <label>最大迭代轮数<select id="pt-rounds"><option value="3">3 轮</option><option value="5" selected>5 轮</option><option value="8">8 轮</option><option value="10">10 轮</option></select></label>
+        <label>&nbsp;<button type="button" id="btn-start-tune" onclick="PT.start()" style="width:100%;margin-top:6px">开始调优</button></label>
+      </div>
+    </section>
+  </div>
+
+  <div class="config-col">
+    <section class="card">
+      <h2>使用说明</h2>
+      <div class="pt-guide">
+        <p><strong>工作流程：</strong></p>
+        <ol>
+          <li>DeepSeek 根据你的需求生成提示词</li>
+          <li>提交到听悟重跑，用真实转写文本执行</li>
+          <li>等待听悟返回实际输出结果</li>
+          <li>DeepSeek 评估输出是否满足期望</li>
+          <li>不满足则自动优化；完成后仍可追问继续改</li>
+        </ol>
+        <p><strong>前提条件：</strong></p>
+        <ul>
+          <li>源 TaskId 对应的任务必须已完成</li>
+          <li>配置中心已填写 DeepSeek API Key</li>
+          <li>每轮迭代约需 30-60 秒（含听悟处理时间）</li>
+        </ul>
+      </div>
+    </section>
+  </div>
+</div>
+
+<div id="pt-progress" style="display:none">
+  <section class="card">
+    <div class="rt-header">
+      <div>
+        <span class="rt-badge" id="pt-status">运行中</span>
+        <span id="pt-round-label" style="margin-left:10px;color:var(--muted)"></span>
+      </div>
+      <button type="button" class="secondary" id="btn-stop-tune" onclick="PT.stop()">停止</button>
+    </div>
+  </section>
+
+  <div id="pt-rounds-container"></div>
+
+  <section class="card" id="pt-final-section" style="display:none">
+    <h2>最终提示词</h2>
+    <div class="copy-row"><button type="button" class="secondary" onclick="PT.copyFinal()">复制提示词</button></div>
+    <textarea id="pt-final-prompt" class="result-text" readonly style="min-height:200px"></textarea>
+  </section>
+
+  <section class="card" id="pt-continue-section" style="display:none">
+    <h2>继续追问修改</h2>
+    <p class="hint">说明哪里不满意，例如：人名仍识别错、格式不对、缺某字段。会基于当前最终提示词和上一轮听悟输出继续改。</p>
+    <label>追问 / 补充反馈
+      <textarea id="pt-feedback" placeholder="例如：&#10;- 发言人名字不要用昵称，统一用全名&#10;- summaryMarkdown 里待办事项要带负责人&#10;- 不要输出 insights 空数组以外的额外字段" style="min-height:120px"></textarea>
+    </label>
+    <div class="two">
+      <label>追加轮数
+        <select id="pt-continue-rounds">
+          <option value="1" selected>1 轮</option>
+          <option value="2">2 轮</option>
+          <option value="3">3 轮</option>
+        </select>
+      </label>
+      <label>&nbsp;<button type="button" id="btn-continue-tune" onclick="PT.continueTune()" style="width:100%;margin-top:6px">继续修改</button></label>
+    </div>
+  </section>
+</div>
+
+<script>
+window.PT = (function() {
+  var stopped = false;
+  var abortController = null;
+  var session = {
+    lastRound: 0,
+    finalPrompt: '',
+    finalResult: '',
+  };
+
+  function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  function addRoundCard(round) {
+    var container = document.getElementById('pt-rounds-container');
+    var existing = document.getElementById('pt-round-' + round);
+    if (existing) return existing;
+    var div = document.createElement('div');
+    div.id = 'pt-round-' + round;
+    div.className = 'card pt-round-card';
+    div.innerHTML = '<h2>第 ' + round + ' 轮</h2><div class="pt-steps"></div>';
+    container.appendChild(div);
+    return div;
+  }
+
+  function addStep(round, icon, html) {
+    var card = document.getElementById('pt-round-' + round);
+    if (!card) card = addRoundCard(round);
+    var steps = card.querySelector('.pt-steps');
+    var div = document.createElement('div');
+    div.className = 'pt-step';
+    div.innerHTML = '<span class="pt-step-icon">' + icon + '</span><div class="pt-step-body">' + html + '</div>';
+    steps.appendChild(div);
+    div.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    return div;
+  }
+
+  function setStatus(text, type) {
+    var el = document.getElementById('pt-status');
+    el.textContent = text;
+    el.className = 'rt-badge rt-badge-' + (type || 'info');
+  }
+
+  function setRunningUI(running) {
+    document.getElementById('btn-start-tune').disabled = running;
+    document.getElementById('btn-continue-tune').disabled = running;
+    if (running) {
+      document.getElementById('pt-continue-section').style.display = 'none';
+    }
+  }
+
+  function runTune(body, options) {
+    options = options || {};
+    stopped = false;
+    if (abortController) {
+      try { abortController.abort(); } catch(e) {}
+    }
+    abortController = new AbortController();
+    setRunningUI(true);
+    document.getElementById('pt-progress').style.display = 'block';
+    if (options.reset) {
+      document.getElementById('pt-rounds-container').innerHTML = '';
+      document.getElementById('pt-final-section').style.display = 'none';
+      document.getElementById('pt-continue-section').style.display = 'none';
+      session = { lastRound: 0, finalPrompt: '', finalResult: '' };
+    }
+    setStatus('运行中', 'recording');
+
+    return fetch('/api/prompt-tuner/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: abortController.signal,
+    }).then(function(resp) {
+      if (!resp.ok) {
+        return resp.json().then(function(d) { throw new Error(d.error || '请求失败'); });
+      }
+      var reader = resp.body.getReader();
+      var decoder = new TextDecoder();
+      var buffer = '';
+      var eventName = null;
+      var dataLines = [];
+
+      function processChunk(chunk) {
+        buffer += decoder.decode(chunk.value || new Uint8Array(), { stream: !chunk.done });
+        var lines = buffer.split(/\r?\n/);
+        buffer = lines.pop();
+
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          if (line === undefined) continue;
+          if (line.startsWith('event:')) {
+            eventName = line.substring(6).trim();
+          } else if (line.startsWith('data:')) {
+            dataLines.push(line.substring(5).trim());
+          } else if (line.trim() === '') {
+            if (eventName && dataLines.length) {
+              try {
+                handleEvent(eventName, JSON.parse(dataLines.join('\n')));
+              } catch(e) {}
+            }
+            eventName = null;
+            dataLines = [];
+          }
+        }
+
+        if (!chunk.done && !stopped) {
+          return reader.read().then(processChunk);
+        }
+      }
+
+      return reader.read().then(processChunk);
+    }).catch(function(err) {
+      if (stopped) return;
+      setStatus('失败', 'error');
+      alert('调优失败: ' + err.message);
+      showContinueIfReady();
+    }).finally(function() {
+      setRunningUI(false);
+    });
+  }
+
+  function showContinueIfReady() {
+    if (session.finalPrompt) {
+      document.getElementById('pt-continue-section').style.display = 'block';
+    }
+  }
+
+  function start() {
+    var taskId = document.getElementById('pt-task-id').value.trim();
+    var goal = document.getElementById('pt-goal').value.trim();
+    if (!taskId || !goal) { alert('请填写 TaskId 和期望输出描述'); return; }
+
+    runTune({
+      taskId: taskId,
+      goal: goal,
+      maxRounds: parseInt(document.getElementById('pt-rounds').value, 10),
+      initialPrompt: document.getElementById('pt-initial').value.trim(),
+      roundOffset: 0,
+    }, { reset: true });
+  }
+
+  function continueTune() {
+    var taskId = document.getElementById('pt-task-id').value.trim();
+    var goal = document.getElementById('pt-goal').value.trim();
+    var feedback = document.getElementById('pt-feedback').value.trim();
+    var prompt = session.finalPrompt || document.getElementById('pt-final-prompt').value.trim();
+    if (!taskId) { alert('请填写 TaskId'); return; }
+    if (!prompt) { alert('没有可继续修改的最终提示词'); return; }
+    if (!feedback) { alert('请填写追问或补充反馈'); return; }
+
+    runTune({
+      taskId: taskId,
+      goal: goal,
+      feedback: feedback,
+      maxRounds: parseInt(document.getElementById('pt-continue-rounds').value, 10),
+      initialPrompt: prompt,
+      lastResult: session.finalResult || '',
+      roundOffset: session.lastRound || 0,
+    }, { reset: false });
+  }
+
+  function handleEvent(name, data) {
+    var round = data.round || 0;
+    switch (name) {
+      case 'round_start':
+        addRoundCard(round);
+        session.lastRound = Math.max(session.lastRound, round);
+        document.getElementById('pt-round-label').textContent = '第 ' + round + ' / ' + data.maxRounds + ' 轮';
+        break;
+      case 'step':
+        addStep(round, '&#9881;', '<span class="pt-step-msg">' + esc(data.message) + '</span>');
+        break;
+      case 'prompt_generated':
+        addStep(round, '&#9998;', '<strong>生成的提示词：</strong><pre class="pt-prompt-pre">' + esc(data.prompt) + '</pre>');
+        break;
+      case 'rerun_submitted':
+        addStep(round, '&#9654;', '重跑任务已提交，TaskId: <code>' + esc(data.rerunTaskId) + '</code>');
+        break;
+      case 'result_ready':
+        addStep(round, '&#9989;', '<strong>听悟输出：</strong><pre class="pt-result-pre">' + esc(data.result.substring(0, 2000)) + (data.result.length > 2000 ? '\n…(已截断)' : '') + '</pre>');
+        break;
+      case 'evaluation':
+        var color = data.score >= 8 ? '#177048' : data.score >= 5 ? '#856404' : '#b62e3d';
+        var scoreHtml = '<span class="pt-score" style="color:' + color + '">' + data.score + '/10</span>';
+        var satHtml = data.satisfied ? '<span class="pt-sat-yes">满足期望</span>' : '<span class="pt-sat-no">需要继续优化</span>';
+        addStep(round, '&#9733;', '<strong>评估：</strong> ' + scoreHtml + ' ' + satHtml + '<p class="pt-analysis">' + esc(data.analysis) + '</p>');
+        break;
+      case 'error':
+        addStep(round || 1, '&#10060;', '<span class="pt-error">' + esc(data.message) + '</span>');
+        setStatus('出错', 'error');
+        showContinueIfReady();
+        break;
+      case 'done':
+        setStatus('完成', 'done');
+        if (data.finalPrompt) {
+          session.finalPrompt = data.finalPrompt;
+          session.finalResult = data.finalResult || '';
+          session.lastRound = Math.max(session.lastRound, data.round || session.lastRound);
+          document.getElementById('pt-final-prompt').value = data.finalPrompt;
+          document.getElementById('pt-final-section').style.display = 'block';
+          document.getElementById('pt-initial').value = data.finalPrompt;
+          document.getElementById('pt-continue-section').style.display = 'block';
+          document.getElementById('pt-feedback').value = '';
+        }
+        addStep(round, '&#127942;', '<strong>' + esc(data.message) + '</strong>');
+        break;
+    }
+  }
+
+  function stop() {
+    stopped = true;
+    if (abortController) {
+      try { abortController.abort(); } catch(e) {}
+    }
+    abortController = null;
+    setStatus('已停止', 'paused');
+    setRunningUI(false);
+    showContinueIfReady();
+  }
+
+  function copyFinal() {
+    var text = document.getElementById('pt-final-prompt').value;
+    navigator.clipboard.writeText(text).then(function() { alert('已复制'); });
+  }
+
+  return { start: start, continueTune: continueTune, stop: stop, copyFinal: copyFinal };
+})();
+</script>
+<script src="{{ url_for('static', filename='prompt-cache.js') }}"></script>
+{% endblock %}
